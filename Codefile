@@ -225,9 +225,9 @@ class Processor:
 					rs["a"] = offset
 
 				# Update Qi in the register file
-				if len(instruction.operands) > 0:
-					dest_type,dest_value ,off= parse_operand(instruction.operands[0])
-					self.register_file.register_status[dest_value] = rs
+			if len(instruction.operands) > 0:
+				dest_type,dest_value ,off= parse_operand(instruction.operands[0])
+				self.register_file.register_status[dest_value] = rs
 
 				# Mark instruction as issued
 				instruction.issue_cycle = self.cycle
@@ -240,18 +240,20 @@ class Processor:
 
 
 
-	def execute(self):
+	def execute(self) : 
 		for fu_type, fu in self.functional_units.items():
 			if fu.current_instruction is None:
 				station = self.reservation_stations[fu_type]
 				
 				for rs in station.stations:
-					if rs["busy"] and rs["qj"] is None and rs["qk"] is None:  # Instruction is ready
+					if rs["busy"] and rs["instruction"]:
 						instruction = rs["instruction"]
-						rs["busy"] = False  # Release the reservation station
-						fu.execute(instruction)
-						instruction.execution_start = self.cycle + 1
-						print(f"[Cycle {self.cycle}] Executing: {instruction.opcode}")
+
+						if rs["qj"] is None and rs["qk"] is None:  # Instruction is ready
+							rs["busy"] = False  # Release the reservation station
+							fu.execute(instruction)
+							instruction.execution_start = self.cycle + 1
+							print(f"[Cycle {self.cycle}] Executing: {instruction.opcode}")
 						if instruction.opcode == "CALL":
 					# CALL changes the PC and stores the return address in R1
 							target_operand = instruction.operands[0]
