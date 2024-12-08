@@ -1,0 +1,493 @@
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import scrolledtext
+class Instruction:
+    def _init_(self, opcode, operands):
+        self.opcode = opcode
+        self.operands = operands
+        self.issue_cycle = None
+        self.execution_start = None
+        self.execution_end = None
+        self.write_cycle = None
+        self.commit_cycle = None
+        self.result = None  # New attribute to store the result of the instruction
+
+class RegisterFile:
+    def _init_(self):
+        self.registers = [0] * 8
+        self.register_status = [None] * 8
+
+    def read(self, reg_index):
+        return self.registers[reg_index]
+
+    def write(self, reg_index, value):
+        if reg_index != 0:  # R0 is read-only
+            self.registers[reg_index] = value
+
+class ReservationStation:
+    def _init_(self, name, num_stations):
+        self.name = name
+        self.stations = [{"busy": False, "instruction": None, "result": None} for _ in range(num_stations)]
+
+class ReorderBuffer:
+    def _init_(self, size):
+        self.entries = []
+        self.size = size
+
+    def add(self, instruction):
+        if len(self.entries) < self.size:
+            self.entries.append(instruction)
+            return True
+        return False
+
+    def all_instructions_committed(self, issue_cycle):
+        """Check if all previous instructions in the buffer are committed."""
+        return all(entries.commit_cycle is not None for entries in self.entries[:issue_cycle])
+
+class Memory:
+    def _init_(self, size):
+        self.memory = [0] * size
+
+    def load(self, address):
+        return self.memory[address]
+
+    def store(self, address, value):
+        self.memory[address] = value
+
+class FunctionalUnit:
+    def _init_(self, cycles_required):
+        self.cycles = cycles_required
+        self.current_instruction = None
+        self.remaining_cycles = 0
+
+    def execute(self, instruction):
+        self.current_instruction = instruction
+        self.remaining_cycles = self.cycles + 1  # +1 to account for the start cycle
+
+    def tick(self):
+        if self.current_instruction:
+            self.remaining_cycles -= 1
+            if self.remaining_cycles == 0:
+                completed_instruction = self.current_instruction
+                self.current_instruction = None
+                return completed_instruction
+        return None
+
+def parse_register(register):
+    if not register.startswith("R"):
+        raise ValueError(f"Invalid register name: {register}")
+    index = int(register[1:])
+    if index < 0 or index > 7:
+        raise ValueError(f"Register index out of range: {register}")
+    return index
+
+def parse_operand(operand):
+    if '(' in operand and ')' in operand:
+        offset, reg = operand.split('(')
+        reg = reg.rstrip(')')
+        offset = int(offset)
+        reg_index = parse_register(reg)
+        return (offset, reg_index)
+    elif operand.startswith('-'):
+        # Handle negative immediate value for CALL instruction
+        offset = int(operand)
+        return (offset, None)
+    else:
+        reg_index = parse_register(operand)
+        return (None, reg_index)
+
+class Processor:
+    def _init_(self,output_hook=None):
+        self.register_file = RegisterFile()
+        self.output_hook = output_hook
+
+        self.memory = Memory(128 * 1024)
+        self.reorder_buffer = ReorderBuffer(6)
+        self.terminated = False  # Flag to indicate if RET has terminated the program
+
+        self.functional_units = {
+            "LOAD": FunctionalUnit(6),
+            "STORE": FunctionalUnit(6),
+            "BEQ": FunctionalUnit(1),
+            "CALL": FunctionalUnit(1),
+            "RET": FunctionalUnit(1),
+            "ADD": FunctionalUnit(2),
+            "ADDI": FunctionalUnit(2),
+            "NAND": FunctionalUnit(1),
+            "MUL": FunctionalUnit(8),
+        }
+        self.reservation_stations = {
+            "LOAD": ReservationStation("LOAD", 2),
+            "STORE": ReservationStation("STORE", 2),
+            "BEQ": ReservationStation("BEQ", 1),
+            "CALL": ReservationStation("CALL", 1),
+            "RET": ReservationStation("RET", 1),
+            "ADD": ReservationStation("ADD", 4),
+            "ADDI": ReservationStation("ADDI", 4),
+            "NAND": ReservationStation("NAND", 2),
+            "MUL": ReservationStation("MUL", 1),
+        }
+        self.cdb = []  # Common Data Bus
+        self.cdb_size = 4  # Max size of the CDB
+        self.cycle = 0
+        self.pc = 0
+        self.instructions = []
+        self.completed_instructions = 0
+        self.branch_mispredictions = 0
+        self.branch_righthpredictions = 0
+        self.total_cycles = 0
+        self.instructions_to_commit= []
+
+    def calculate_address(self, operand):
+        imm, base = operand.split('(')
+        base_reg = parse_register(base[:-1])  # Remove the trailing ')' and get the register index
+        immediate = int(imm)
+        base_value = self.register_file.read(base_reg)
+        return base_value + immediate
+
+    def issue(self, instruction=None):
+        if instruction is None:
+        # Get the instruction at the current PC
+            instruction = self.instructions[self.pc]
+        opcode = instruction.opcode
+        rs_type = opcode
+        if rs_type not in self.reservation_stations:
+            raise ValueError(f"Unsupported instruction: {opcode}")
+
+        station = self.reservation_stations[rs_type]
+        for rs in station.stations:
+            if not rs["busy"]:
+                rs["busy"] = True
+                rs["instruction"] = instruction
+
+                # Mark instruction as issued
+                instruction.issue_cycle = self.cycle
+                print(f"[Cycle {self.cycle}] Issued: {instruction.opcode}")
+                self.reorder_buffer.add(instruction)
+                
+                return True
+        return False
+
+    def execute(self):
+    # Execute all instructions in reservation stations
+        for fu_type, fu in self.functional_units.items():
+            if fu.current_instruction is None:
+            # Find the next instruction from reservation stations that can be executed
+                station = self.reservation_stations[fu_type]
+                for rs in station.stations:
+                    if rs["busy"] and rs["instruction"]:
+                        instruction = rs["instruction"]
+                        rs["busy"] = False  # Release the reservation station
+                        fu.execute(instruction)
+                        instruction.execution_start = self.cycle + 1
+                        print(f"[Cycle {self.cycle}] Executing: {instruction.opcode}")
+                        if instruction.opcode == "CALL":
+                    # CALL changes the PC and stores the return address in R1
+                            target_operand = instruction.operands[0]
+                            target_offset = int(target_operand)  # 7-bit signed constant
+
+                    # Save PC + 1 (next instruction address) into R1
+                            self.register_file.write(parse_register("R1"), self.pc + 1)
+
+                    # Update PC to the target address (after CALL)
+                            self.pc += target_offset
+                            instruction.execution_start = self.cycle + 1
+                            instruction.execution_end = self.cycle + 1 
+                            instruction.write_cycle = self.cycle + 2  # CALL doesn't need multiple cycles for execution
+ # CALL doesn't need multiple cycles for execution
+                            print(f"[Cycle {self.cycle}] CALL Target Address: {target_offset}")
+                            self.issue(self.instructions[self.pc]) 
+                            
+
+                        elif instruction.opcode == "RET":
+                    # RET loads the return address from R1 and sets the PC to that address
+                            return_address = self.register_file.read(parse_register("R1"))
+                            self.pc = return_address
+                            instruction.execution_start = self.cycle + 1
+                            instruction.execution_end = self.cycle + 1  # RET completes in one cycle
+                            log = f"[Cycle {self.cycle}] RET executed: Returned to address {self.pc}"
+                            self.print_instruction_table(log) 
+                            self.cycle+=1                             
+                            self.issue(self.instructions[self.pc]) 
+
+                            self.terminated = True
+
+                            
+
+                        elif instruction.opcode == "BEQ":
+                    # BEQ checks if registers are equal
+                            reg1_index = parse_register(instruction.operands[0])  # First register
+                            reg2_index = parse_register(instruction.operands[1])  # Second register
+                            target_offset = int(instruction.operands[2])  # Target offset
+
+                    # Compare the registers
+                            if self.register_file.read(reg1_index) == self.register_file.read(reg2_index):
+                        # If equal, branch to the target address
+                                self.pc += target_offset
+                                instruction.execution_start = self.cycle + 1
+                                instruction.execution_end = self.cycle + 1  # BEQ takes one cycle
+                                self.branch_mispredictions+=1
+                                print(f"[Cycle {self.cycle}] BEQ executed: Branching to {self.pc}")
+                                print(f"[Cycle {self.cycle}] BEQ: R[{reg1_index}]={self.register_file.read(reg1_index)}, "f"R[{reg2_index}]={self.register_file.read(reg2_index)}, Target Offset={target_offset}")
+
+
+                            else:
+                        # If not equal, do nothing and move to the next instruction
+                                instruction.execution_start = self.cycle + 1
+                                instruction.execution_end = self.cycle + 1
+                                self.branch_righthpredictions+=1
+                                print(f"[Cycle {self.cycle}] BEQ skipped: Registers are not equal")
+                                print(f"[Cycle {self.cycle}] BEQ: R[{reg1_index}]={self.register_file.read(reg1_index)}, "f"R[{reg2_index}]={self.register_file.read(reg2_index)}, Target Offset={target_offset}")
+
+    
+                        
+
+        # Execute the functional unit
+            completed_instruction = fu.tick()
+            if completed_instruction:
+            # Update the instruction write and commit cycles
+                completed_instruction.execution_end = self.cycle
+                self.write_result(completed_instruction)
+                self.commit_result(completed_instruction)
+
+    
+            
+    def write_result(self, instruction):
+        if instruction.opcode == "CALL":
+        # CALL stores the return address (PC + 1) in R1
+            self.register_file.write(parse_register("R1"), self.pc + 1)
+            instruction.write_cycle = self.cycle + 1  # Write happens 1 cycle after execution
+        elif instruction.opcode == "RET" or instruction.opcode == "BEQ" :
+        # RET doesn't perform any direct write to registers, but it is still processed in the pipeline
+            instruction.write_cycle = self.cycle + 1
+        
+        elif instruction.opcode != "LOAD" and instruction.opcode != "STORE":
+    # Standard arithmetic operations: ADD, MUL, etc.
+            dest_reg_index = parse_register(instruction.operands[0])  # Destination register
+            src1_reg_index = parse_register(instruction.operands[1])  # First source register
+
+    # Handle the second operand (could be a register or an immediate)
+            if instruction.operands[2].startswith("R"):  # Check if it's a register
+                src2_value = self.register_file.read(parse_register(instruction.operands[2]))
+            else:
+        # Parse as an immediate value
+                src2_value = int(instruction.operands[2])
+
+    # Read the value of the first source register
+            src1_value = self.register_file.read(src1_reg_index)
+
+    # Perform the operation
+            if instruction.opcode == "ADD":
+                instruction.result = src1_value + src2_value
+            elif instruction.opcode == "MUL":
+                instruction.result = src1_value * src2_value
+            elif instruction.opcode == "NAND":
+                instruction.result = ~(src1_value & src2_value)
+            elif instruction.opcode == "ADDI":
+                instruction.result = src1_value + src2_value  # Same logic as ADD for immediates
+            else:
+                raise ValueError(f"Unsupported arithmetic operation: {instruction.opcode}")
+
+    # Write the result to the destination register
+            self.register_file.write(dest_reg_index, instruction.result)
+            instruction.write_cycle = self.cycle + 1  # Write happens 1 cycle after execution
+  # Write happens 1 cycle after execution
+
+        elif instruction.opcode == "LOAD" or instruction.opcode == "STORE":
+        # Handle memory instructions as usual
+            address = self.calculate_address(instruction.operands[1])
+            if instruction.opcode == "LOAD":
+                value = self.memory.load(address)
+                dest_reg_index = parse_register(instruction.operands[0])
+                instruction.result = value
+                self.register_file.write(dest_reg_index, value)
+            elif instruction.opcode == "STORE":
+                src_reg_index = parse_register(instruction.operands[0])
+                value_to_store = self.register_file.read(src_reg_index)
+                self.memory.store(address, value_to_store)
+
+            instruction.write_cycle = self.cycle + 1  # Write happens 1 cycle after execution
+
+
+    def commit_result(self, instruction):
+    # Check if the instruction can be committed independently each cycle
+        if self.reorder_buffer.all_instructions_committed(instruction.issue_cycle) or instruction.issue_cycle == 0:
+            self.cdb.append(instruction)
+            instruction.commit_cycle = self.cycle + 2
+            self.completed_instructions += 1
+        else:
+        # Store the instruction if not yet committed
+            self.instructions_to_commit.append(instruction)
+
+    def handle_cdb(self):
+        if self.cdb and not self.cdb_full():
+        # Write result from CDB to all awaiting instructions in reservation stations
+            for rs_type, station in self.reservation_stations.items():
+                for rs in station.stations:
+                    if rs["instruction"] in self.cdb and rs["instruction"].commit_cycle is None:
+                        rs["instruction"].result = rs["instruction"].result
+                        rs["busy"] = False
+            self.cdb = []  # Clear CDB after writing to all awaiting instructions
+
+    
+
+    def cdb_full(self):
+        return len(self.cdb) >= self.cdb_size  # Check if CDB is full based on its maximum size
+
+
+            
+
+
+    def branch_mispredict(self):
+        # Always not taken prediction strategy
+        return False
+
+    def print_instruction_table(self,log=""):
+        output = f"\n[Cycle {self.cycle}]\n"
+        if log:
+            output += f"\n{log}\n" 
+        output += "\nInstruction table:\n"
+        output += "Opcode | Issue | Exec Start | Exec End | Write | Commit\n"
+        
+        for inst in self.instructions:
+            output += (f"{inst.opcode:<6} | "
+                       f"{inst.issue_cycle if inst.issue_cycle is not None else '-':<5} | "
+                       f"{inst.execution_start if inst.execution_start is not None else '-':<10} | "
+                       f"{inst.execution_end if inst.execution_end is not None else '-':<9} | "
+                       f"{inst.write_cycle if inst.write_cycle is not None else '-':<5} | "
+                       f"{inst.commit_cycle if inst.commit_cycle is not None else '-'}\n")
+        
+
+        if self.output_hook:
+            self.output_hook(output)  # Send output to the GUI
+        else:
+            print(output) 
+
+    def simulate(self, instructions):
+        self.instructions = instructions
+        while not self.terminated and (
+        self.pc < len(self.instructions) or any(
+            rs["busy"] for station in self.reservation_stations.values() for rs in station.stations
+        ) or any(fu.current_instruction for fu in self.functional_units.values())
+    ):
+            # Issue instructions
+            if self.pc < len(self.instructions):
+                if self.issue(self.instructions[self.pc]):
+                    self.pc += 1
+
+            # Execute instructions
+            self.execute()
+            # Handle branches
+            
+                
+
+            # Write result to the CDB if available
+            self.handle_cdb()
+
+            # Increment cycle count
+            self.cycle += 1
+            self.print_instruction_table()
+
+        # Printing final performance metrics
+        self.print_performance_metrics()
+
+    def print_performance_metrics(self):
+        print("\nSimulation completed.")
+        print(f"Total execution time (cycles): {self.cycle}")
+        print("Instruction execution timeline:")
+        print("Opcode | Issue | Exec Start | Exec End | Write | Commit")
+
+        for inst in self.instructions:
+            print(f"{inst.opcode:<6} | "
+                  f"{inst.issue_cycle if inst.issue_cycle is not None else '-':<5} | "
+                  f"{inst.execution_start if inst.execution_start is not None else '-':<10} | "
+                  f"{inst.execution_end if inst.execution_end is not None else '-':<9} | "
+                  f"{inst.write_cycle if inst.write_cycle is not None else '-':<5} | "
+                  f"{inst.commit_cycle if inst.commit_cycle is not None else '-'}")
+
+        ipc = self.completed_instructions / (self.cycle)
+        branch_misprediction_rate = (self.branch_mispredictions /  (self.branch_righthpredictions+self.branch_mispredictions)) * 100 if (self.branch_righthpredictions+self.branch_mispredictions) > 0 else 0
+        print(f"\nTotal instructions completed: {self.completed_instructions}")
+        print(f"Total cycles: {self.cycle}")
+        print(f"IPC (Instructions Per Cycle): {ipc:.2f}")
+        print(f"Branch misprediction rate: {branch_misprediction_rate:.2f}%")
+
+class ProcessorSimulatorGUI:
+    def _init_(self, root):
+        self.root = root
+        self.root.title("RISC-V Processor Simulator")
+        self.processor = Processor()
+
+        # Input Frame
+        self.input_frame = tk.Frame(root)
+        self.input_frame.pack(pady=10)
+
+        self.instruction_label = tk.Label(self.input_frame, text="Enter Instructions (one per line):")
+        self.instruction_label.grid(row=0, column=0, sticky="w")
+
+        self.instruction_text = scrolledtext.ScrolledText(self.input_frame, width=50, height=10)
+        self.instruction_text.grid(row=1, column=0, pady=5)
+
+        self.simulate_button = tk.Button(self.input_frame, text="Simulate", command=self.run_simulation)
+        self.simulate_button.grid(row=2, column=0, pady=10)
+
+        # Output Frame
+        self.output_frame = tk.Frame(root)
+        self.output_frame.pack(pady=10)
+
+        self.output_label = tk.Label(self.output_frame, text="Simulation Output:")
+        self.output_label.grid(row=0, column=0, sticky="w")
+
+        self.output_text = scrolledtext.ScrolledText(self.output_frame, width=80, height=20)
+        self.output_text.grid(row=1, column=0, pady=5)
+
+    def parse_user_input(self):
+        instructions_raw = self.instruction_text.get("1.0", tk.END).strip().split("\n")
+        instructions = []
+        for line in instructions_raw:
+            parts = line.split()
+            if len(parts) < 1:
+                continue
+            opcode = parts[0]
+            operands = parts[1:] if len(parts) > 1 else []
+            instructions.append(Instruction(opcode, operands))
+        return instructions
+
+    def display_cycle(self, cycle, table):
+        self.output_text.insert(tk.END, f"\n[Cycle {cycle}]\n")
+        self.output_text.insert(tk.END, "Opcode | Issue | Exec Start | Exec End | Write | Commit\n")
+        self.output_text.insert(tk.END, "-" * 55 + "\n")
+        for row in table:
+            self.output_text.insert(tk.END, f"{row}\n")
+        self.output_text.insert(tk.END, "\n")
+        self.output_text.see(tk.END)  # Scroll to the end
+
+    def append_to_output(self, message):
+        self.output_text.insert(tk.END, message + "\n")
+        self.output_text.see(tk.END)  # Automatically scroll to the bottom
+
+    def run_simulation(self):
+        instructions = self.parse_user_input()
+        if not instructions:
+            messagebox.showerror("Input Error", "Please enter valid instructions.")
+            return
+
+        self.output_text.delete("1.0", tk.END)  # Clear output box
+
+        # Create a new processor with a custom output hook
+        self.processor = Processor(output_hook=self.append_to_output)
+        self.processor.simulate(instructions)
+
+        # Display final results
+        self.output_text.insert(tk.END, "\nSimulation Complete\n")
+        self.output_text.insert(tk.END, f"Total Cycles: {self.processor.cycle}\n")
+        ipc = self.processor.completed_instructions / (self.processor.cycle)
+        branch_misprediction_rate = (self.processor.branch_mispredictions / (self.processor.branch_righthpredictions + self.processor.branch_mispredictions)) * 100 if (self.processor.branch_righthpredictions+self.processor.branch_mispredictions) > 0 else 0
+
+        self.output_text.insert(tk.END, f"IPC (Instructions Per Cycle): {ipc:.2f}\n")
+        self.output_text.insert(tk.END, f"Branch Misprediction Rate: {branch_misprediction_rate:.2f}%\n")
+
+if _name_ == "_main_":
+    root = tk.Tk()
+    gui = ProcessorSimulatorGUI(root)
+    root.mainloop()
